@@ -574,13 +574,13 @@ curl -X POST http://localhost:8000/v1/deactivation-plans \
 
 ## 双端协议演练会话
 
-除上述四个离线分析接口外，服务还提供**有状态演练会话**：创建会话后可以逐个执行转移、随时查询当前配置与完整执行轨迹，也可以修改协议后从新初态重放已执行步骤，继续演练；还可以从指定轨迹位置另开**分支会话**，两边独立续演；另一会话中已走通的后续轨迹也可以直接**接回**目标会话，免去逐步重演。两次演练还可以按方向**对比消息交换**：只比较各自 `(action, message)` 序列，忽略转移 ID、端点状态与两方向之间的交错。
+除上述四个离线分析接口外，服务还提供**有状态演练会话**：创建会话后可以逐个执行转移、随时查询当前配置与完整执行轨迹，也可以修改协议后从新初态重放已执行步骤，继续演练；还可以从指定轨迹位置另开**分支会话**，两边独立续演；另一会话中已走通的后续轨迹也可以直接**接回**目标会话，免去逐步重演。两次演练还可以按方向**对比消息交换**：只比较各自 `(action, message)` 序列，忽略转移 ID、端点状态与两方向之间的交错。会话还可以被**锁定为只读基准**：锁定后执行、替换协议与作为接回目标均被拒绝，查询、对比、分支与作为接回来源不受影响，解锁后按新版本继续演练。
 
-- 会话（协议、轨迹 ID、版本）持久化在**本地 SQLite 数据库**中，所有进程共享同一文件：服务或容器重建后仍可按原会话 ID 查询并继续执行、替换协议，版本不会回退。
-- 服务默认以 **2 个 Uvicorn worker** 进程运行，启动时自动建库建表（无需迁移旧数据）。
-- 每次成功执行转移、替换协议或接回轨迹，会话 `version` 加 1（创建时为 `0`）。
+- 会话（协议、轨迹 ID、版本、锁定标记）持久化在**本地 SQLite 数据库**中，所有进程共享同一文件：服务或容器重建后仍可按原会话 ID 查询并继续执行、替换协议，版本不会回退。
+- 服务默认以 **2 个 Uvicorn worker** 进程运行，启动时自动建库建表（无需迁移旧数据）；旧版数据库启动时自动补充锁定列，已有协议、轨迹与版本保持不变，旧会话默认未锁定。
+- 每次成功执行转移、替换协议、接回轨迹或设置锁定，会话 `version` 加 1（创建时为 `0`）。
 - 修改类请求必须携带 `expected_version`：与当前版本不一致返回 `409`；两个进程以同一 `expected_version` 并发修改同一会话时只有一项成功，其余返回 `409` 及当前版本。
-- 版本检查、轨迹重放与写入在同一个 SQLite 事务（`BEGIN IMMEDIATE`）内完成，针对同一份已提交状态；任何失败（含重放失败）都不改动已存数据。成功响应返回本次提交的完整快照（不混入随后提交的数据），查询永远只读到完整的已提交版本。
+- 版本检查、锁定检查、轨迹重放与写入在同一个 SQLite 事务（`BEGIN IMMEDIATE`）内完成，针对同一份已提交状态；任何失败（含重放失败）都不改动已存数据。成功响应返回本次提交的完整快照（不混入随后提交的数据），查询永远只读到完整的已提交版本。
 
 ### 接口
 
@@ -590,6 +590,7 @@ curl -X POST http://localhost:8000/v1/deactivation-plans \
 | `GET` | `/v1/sessions/{id}` | 查询会话快照 |
 | `POST` | `/v1/sessions/{id}/transitions` | 执行单个转移，请求体 `{"transition_id": ..., "expected_version": ...}` |
 | `PUT` | `/v1/sessions/{id}/protocol` | 替换完整协议，请求体 `{"protocol": {...}, "expected_version": ...}` |
+| `PUT` | `/v1/sessions/{id}/lock` | 设置锁定标记，请求体 `{"expected_version": ..., "locked": ...}` |
 | `POST` | `/v1/sessions/{id}/branches` | 从指定轨迹位置另开分支会话，请求体 `{"expected_version": ..., "prefix_length": ...}`，返回新会话视图（版本 0） |
 | `POST` | `/v1/sessions/{id}/adoptions` | 把来源会话的后续轨迹接回本目标会话，请求体 `{"source_session_id": ..., "target_expected_version": ..., "source_expected_version": ...}` |
 | `POST` | `/v1/session-comparisons` | 按消息方向对比两次演练（只读、不改数据与版本），请求体 `{"left_session_id": ..., "right_session_id": ..., "left_expected_version": ..., "right_expected_version": ...}` |
@@ -598,6 +599,7 @@ curl -X POST http://localhost:8000/v1/deactivation-plans \
 
 - `id`：会话 ID；
 - `version`：当前版本（创建为 0，每次成功修改加 1）；
+- `locked`：是否已锁定为只读基准（新建会话与旧库会话默认为 `false`）；
 - `protocol`：当前完整协议（与创建请求一致）；
 - `configuration`：当前两端状态与两个队列；
 - `trace`：完整执行轨迹，每步含 `index`（从 1 计）、`transition_id`、`from`、`to`、`action`、`message` 及执行后的状态与队列；
@@ -605,10 +607,10 @@ curl -X POST http://localhost:8000/v1/deactivation-plans \
 
 状态码：
 
-- 成功：创建与分支 `201`，执行/替换/接回/查询 `200`；
+- 成功：创建与分支 `201`，执行/替换/锁定/接回/查询 `200`；
 - `404`：未知会话（接回时目标或来源任一未知）；
-- `409`：`expected_version` 过期、转移在当前配置下不可执行（含 ID 不存在）、或会话已处于完成配置；接回时还包括目标或来源版本过期——响应体在通用 `current_version` 之外以 `session`（`"target"`/`"source"`）与 `session_id` 指出是哪个会话过期；
-- `422`：请求体不合法（复用原协议校验，规则同下节）；替换协议时还包括**重放失败**——从新协议初态按已执行 ID 重放时，任一步不可执行或在轨迹结束前到达完成配置，响应体 `detail.first_failed_step` 给出从 1 计的首个失败步；分支时还包括 `prefix_length` 非法（布尔值、非整数、负数或超过当前轨迹长度）；接回时还包括：目标与来源是同一会话（`same_session`）、两边协议字段值或列表顺序不同（`protocol_mismatch`）、目标轨迹 ID 序列不是来源轨迹的严格前缀（`trace_not_strict_prefix`）。
+- `409`：`expected_version` 过期、转移在当前配置下不可执行（含 ID 不存在）、会话已处于完成配置、或会话已锁定（执行/替换/作为接回目标，错误体 `{"error": "session_locked", ...}`）；接回时还包括目标或来源版本过期——响应体在通用 `current_version` 之外以 `session`（`"target"`/`"source"`）与 `session_id` 指出是哪个会话过期；
+- `422`：请求体不合法（复用原协议校验，规则同下节）；锁定请求的 `locked` 不是布尔值；替换协议时还包括**重放失败**——从新协议初态按已执行 ID 重放时，任一步不可执行或在轨迹结束前到达完成配置，响应体 `detail.first_failed_step` 给出从 1 计的首个失败步；分支时还包括 `prefix_length` 非法（布尔值、非整数、负数或超过当前轨迹长度）；接回时还包括：目标与来源是同一会话（`same_session`）、两边协议字段值或列表顺序不同（`protocol_mismatch`）、目标轨迹 ID 序列不是来源轨迹的严格前缀（`trace_not_strict_prefix`）。
 
 对比接口为只读操作，状态码：成功 `200`；任一会话 ID 未知返回 `404`；左或右的期望版本过期返回 `409`，响应体在通用 `current_version` 之外以 `side`（`"left"`/`"right"`）与 `session_id` 指出过期侧（左侧优先判定）；请求体不合法返回 `422`。对比不修改任何会话、不消耗版本。
 
@@ -684,6 +686,83 @@ curl -s -X PUT http://localhost:8000/v1/sessions/$SID/protocol \
 
 此时会话保持旧协议与版本 `3` 不变。用过期版本（如 `"expected_version": 2`）替换返回 `409`；查询不存在的会话 ID 返回 `404`。
 
+### 锁定会话为只读基准：`PUT /v1/sessions/{id}/lock`
+
+把选定演练会话锁为只读基准，需要时再解除锁定：
+
+- 请求体 `{"expected_version": ..., "locked": ...}`；`locked` 必须是布尔值，`"true"`、`1`、`0` 等非布尔输入一律返回 `422`。
+- 每次成功设置**只改变锁定标记**、`version` 加 `1`，协议、轨迹与当前配置保持不变；响应是含 `locked` 字段的完整会话快照。重复设置同一取值同样只推进版本。
+- **锁定期间**：执行转移、替换协议、作为接回目标均返回 `409`（`{"detail": {"error": "session_locked", ...}}`）；查询、对比、作为接回来源与创建分支不受影响，分支出的新会话默认未锁定。
+- 锁定检查与写入针对同一份已提交状态（同一个 `BEGIN IMMEDIATE` 事务）：同一 `expected_version` 的锁定设置与执行、替换协议或目标接回并发时**最多一项成功**，其余返回 `409` 及 `current_version`；未知会话返回 `404`；任何失败都不改动数据。
+- 解锁（`"locked": false`）同样是版本化修改，之后可用**新版本**继续执行转移或替换协议。
+- 锁定标记持久保存在会话库中；旧版数据库在启动时自动补充该列，已有会话的协议、轨迹与版本不变，默认未锁定。
+
+#### 可执行示例：锁定拒写、解锁续演（端口 8000）
+
+新建会话并执行 `t1`（`version` 变为 `1`）：
+
+```bash
+SID=$(curl -s -X POST http://localhost:8000/v1/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "A": { "states": [0, 1], "initial": 0, "finals": [1] },
+    "B": { "states": [0, 1], "initial": 0, "finals": [1] },
+    "transitions": [
+      { "id": "t1", "from": "A", "to": "B", "action": "send",    "message": "m", "source": 0, "target": 1 },
+      { "id": "t4", "from": "A", "to": "B", "action": "receive", "message": "m", "source": 0, "target": 1 }
+    ]
+  }' | python3 -c 'import sys, json; print(json.load(sys.stdin)["id"])')
+curl -s -o /dev/null -X POST http://localhost:8000/v1/sessions/$SID/transitions \
+  -H 'Content-Type: application/json' \
+  -d '{"transition_id": "t1", "expected_version": 0}'
+```
+
+锁定为只读基准（返回 `200`，`version` 变为 `2`，`locked` 为 `true`，轨迹与配置不变）：
+
+```bash
+curl -s -X PUT http://localhost:8000/v1/sessions/$SID/lock \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_version": 1, "locked": true}'
+```
+
+锁定期间执行转移（或替换协议、作为接回目标）返回 `409`，会话保持原样：
+
+```bash
+curl -s -i -X POST http://localhost:8000/v1/sessions/$SID/transitions \
+  -H 'Content-Type: application/json' \
+  -d '{"transition_id": "t4", "expected_version": 2}'
+# HTTP/1.1 409 Conflict
+# {"detail":{"error":"session_locked","session_id":"…"}}
+```
+
+`locked` 非布尔值返回 `422`；`expected_version` 过期返回 `409` 及 `current_version`：
+
+```bash
+curl -s -i -X PUT http://localhost:8000/v1/sessions/$SID/lock \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_version": 2, "locked": "yes"}'
+# HTTP/1.1 422 Unprocessable Entity
+
+curl -s -i -X PUT http://localhost:8000/v1/sessions/$SID/lock \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_version": 0, "locked": false}'
+# HTTP/1.1 409 Conflict
+# {"detail":{"error":"version_conflict","current_version":2}}
+```
+
+解锁（`version` 变为 `3`），随后用新版本继续执行 `t4` 至完成：
+
+```bash
+curl -s -X PUT http://localhost:8000/v1/sessions/$SID/lock \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_version": 2, "locked": false}'
+
+curl -s -X POST http://localhost:8000/v1/sessions/$SID/transitions \
+  -H 'Content-Type: application/json' \
+  -d '{"transition_id": "t4", "expected_version": 3}'
+# 200：version 变为 4，locked 为 false，协议到达完成配置
+```
+
 ### 分支会话：`POST /v1/sessions/{id}/branches`
 
 在源会话的指定轨迹位置另开一条独立分支，源会话保持可用且不被修改：
@@ -693,7 +772,7 @@ curl -s -X PUT http://localhost:8000/v1/sessions/$SID/protocol \
 - 新会话的当前配置与可执行转移由前缀轨迹从初态**重算**，不复制源会话末态；`prefix_length` 为 `0` 时即同一协议的空轨迹新会话，为轨迹全长时相当于复制整个会话。
 - 版本检查与复制针对**同一份源快照**：与源会话的修改并发时，要么复制该版本的完整快照，要么按过期返回 `409` 及 `current_version`；源会话不存在返回 `404`。
 - 任何失败都不会生成分支，源会话始终不变；同一源版本可多次分支，其版本号不被消耗。
-- 分支会话是普通会话：沿用执行、替换协议与查询接口，之后两边互不影响，重启后仍可续演。
+- 分支会话是普通会话：沿用执行、替换协议与查询接口，之后两边互不影响，重启后仍可续演。已锁定的源会话仍可分支，新分支默认未锁定。
 
 #### 分支后分别续演示例（端口 8000）
 
@@ -760,14 +839,15 @@ curl -s -X POST http://localhost:8000/v1/sessions/$SID/branches \
 - 目标轨迹 ID 序列必须是来源轨迹 ID 序列的**严格前缀**：共享位置的转移 ID 必须逐一相同，且来源必须至少还剩一步未被目标走过（空目标轨迹是任意非空来源轨迹的前缀；两边轨迹等长——含两边皆空——均拒绝）。
 - 两边**当前协议必须完全一致**：任一字段值不同（状态集、初态、终态，或某条转移的端点/动作/消息/source/target）即拒绝；同一协议仅转移（或状态、终态）**列表顺序不同**也拒绝。
 - 成功时只把来源轨迹中目标尚未走过的**剩余后缀**追加到目标（共享前缀不重写），目标 `version` 加 `1`，轨迹与当前配置按原规则从协议初态重算，响应返回目标本次提交的**完整快照**；来源会话只读不写、版本不消耗，同一来源版本可被任意多个目标接回。
-- 两边的版本读取、协议一致性与严格前缀检查、目标写入全部在同一个 `BEGIN IMMEDIATE` 事务内、基于**同一份已提交快照**完成：与目标或来源任一会话的修改并发时，要么接纳指定两个版本的完整成果，要么按版本过期返回 `409`；同一目标版本下，接回与执行转移、替换协议互斥，恰好一项成功。
+- 两边的版本读取、协议一致性与严格前缀检查、目标写入全部在同一个 `BEGIN IMMEDIATE` 事务内、基于**同一份已提交快照**完成：与目标或来源任一会话的修改并发时，要么接纳指定两个版本的完整成果，要么按版本过期返回 `409`；同一目标版本下，接回与执行转移、替换协议、锁定设置互斥，恰好一项成功。
+- 目标会话已锁定时接回返回 `409`（`session_locked`）；来源会话只读不写，锁定不影响其作为接回来源。
 - 任何失败都不改动两个会话。
 
 状态码与错误体：
 
 - 成功：`200`，响应为目标会话视图（同查询接口）；
 - `404`：目标或来源会话 ID 未知（响应体 `{"detail": "unknown session"}`）；
-- `409`：版本过期，`detail` 指出对应会话及其当前版本：
+- `409`：版本过期，或目标会话已锁定（`session_locked`）。版本过期时 `detail` 指出对应会话及其当前版本：
 
 ```json
 { "detail": { "error": "version_conflict", "current_version": 2, "session": "source", "session_id": "8f51ba3f6921412080fab99706d5290a" } }
@@ -1111,7 +1191,7 @@ curl -s http://localhost:8000/v1/sessions/$EMPTY \
 ### 存储位置与卷保留规则
 
 - 数据库文件：容器内 **`/data/sessions.db`**（WAL 模式，运行时可能伴随 `-wal` / `-shm` 文件），可用环境变量 `SESSIONS_DB` 覆盖；本地开发缺省为工作目录下的 `./sessions.db`。
-- Compose 命名卷 `sessions-data` 挂载到 `/data`；首次挂载时卷会继承镜像中 `/data` 的属主（运行用户 `nobody`），保证运行用户可写。服务启动时自动建库建表。
+- Compose 命名卷 `sessions-data` 挂载到 `/data`；首次挂载时卷会继承镜像中 `/data` 的属主（运行用户 `nobody`），保证运行用户可写。服务启动时自动建库建表；旧版数据库启动时自动补充 `locked` 列（默认未锁定），已有会话的协议、轨迹与版本保持不变。
 - `docker compose stop` / `restart` / `down` / `up --build` 都**保留**命名卷，会话数据不丢；`docker compose down -v` 会**删除**命名卷，全部会话随之清除。
 - 查看卷：`docker volume ls | grep sessions-data`。
 

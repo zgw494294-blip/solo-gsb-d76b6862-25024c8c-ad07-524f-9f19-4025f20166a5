@@ -1,6 +1,6 @@
 from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field, WrapValidator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, WrapValidator, model_validator
 from typing_extensions import Self
 
 
@@ -250,6 +250,15 @@ class AdoptionRequest(BaseModel):
     source_expected_version: Annotated[int, Field(ge=0)]
 
 
+class SessionLockRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    # StrictBool rejects 0/1, "true"/"false" and every other non-boolean
+    # payload with a 422 instead of coercing it.
+    locked: StrictBool
+    expected_version: Annotated[int, Field(ge=0)]
+
+
 class SessionComparisonRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
@@ -266,6 +275,7 @@ class SessionComparisonRequest(BaseModel):
 class SessionView(BaseModel):
     id: str
     version: int
+    locked: bool
     protocol: DeadlockRequest
     configuration: ConfigurationView
     trace: list[PathStep]
