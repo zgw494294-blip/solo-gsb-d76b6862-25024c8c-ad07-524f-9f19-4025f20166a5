@@ -49,6 +49,25 @@ ignored. Both rows are read inside one read transaction, so the two snapshots
 always belong to the same committed state: when either named expected version
 is stale the comparison answers 409 instead of mixing revisions; an unknown id
 answers 404.
+
+A drill session can be locked as a read-only baseline and unlocked again
+later. The lock is a persistent per-session flag stored in the same row
+(default false, also for every row of a pre-lock database, which is upgraded
+automatically on startup without touching its protocol, trace or version).
+Setting the flag goes through ``PUT /v1/sessions/{id}/lock`` with an
+``expected_version``; every successful setting — locking or unlocking, even to
+the already current value — changes only the flag and advances the version by
+one, returning the full snapshot with its ``locked`` field. While locked the
+session still answers queries and comparisons, can be used as an adoption
+source and can be branched (a branch starts unlocked, copying no flag); only
+the writes that move the drill itself forward are refused with 409: transition
+execution, protocol replacement and adoption targeting it. The lock check and
+the write run against the same committed state inside one ``BEGIN IMMEDIATE``
+transaction, so on one version a lock setting and an execution, a protocol
+replacement or a targeting adoption are mutually exclusive — at most one
+succeeds and every loser answers 409 naming the stored ``current_version``
+(never 422: a lock refusal is a conflict, like the other same-version races).
+After unlocking, the drill resumes from the snapshot under the new version.
 """
 
 import json
@@ -75,6 +94,7 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     version INTEGER NOT NULL,
+    locked INTEGER NOT NULL DEFAULT 0,
     protocol TEXT NOT NULL,
     trace_ids TEXT NOT NULL
 )
@@ -85,7 +105,15 @@ _initialized = False
 
 
 def init_storage() -> None:
-    """Create the database directory, file and schema once per process."""
+    """Create the database directory, file and schema once per process.
+
+    A database created by an older release has no ``locked`` column; it is
+    upgraded in place here by adding the column with default 0. The upgrade
+    only adds the flag: every stored protocol, trace and version stays byte
+    for byte as it was. The upgrade takes the write lock first, so the several
+    worker processes starting together serialize on it and each observes the
+    upgraded schema exactly once.
+    """
     global _initialized
     if _initialized:
         return
@@ -94,12 +122,33 @@ def init_storage() -> None:
             return
         directory = os.path.dirname(os.path.abspath(_DB_PATH))
         os.makedirs(directory, exist_ok=True)
-        connection = sqlite3.connect(_DB_PATH, timeout=_BUSY_TIMEOUT_MS / 1000)
+        connection = sqlite3.connect(
+            _DB_PATH, timeout=_BUSY_TIMEOUT_MS / 1000, isolation_level=None
+        )
         try:
             # WAL persists in the database file and lets readers work
             # concurrently with the single writer across processes.
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute(_SCHEMA)
+            connection.commit()
+            # The check and the upgrade hold the write lock as one unit, so the
+            # several worker processes starting against one pre-lock database
+            # serialize: the first one adds the column and commits, and every
+            # other process waits on busy_timeout and then observes the column
+            # already present instead of failing on a duplicate ALTER TABLE.
+            connection.execute("BEGIN IMMEDIATE")
+            columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(sessions)")
+            }
+            if "locked" not in columns:
+                # Pre-lock database: every existing session starts unlocked;
+                # existing rows pick up the column default and their protocol,
+                # trace and version are left untouched.
+                connection.execute(
+                    "ALTER TABLE sessions "
+                    "ADD COLUMN locked INTEGER NOT NULL DEFAULT 0"
+                )
             connection.commit()
         finally:
             connection.close()
@@ -124,39 +173,38 @@ def create_session(protocol) -> dict:
     connection = _connect()
     try:
         connection.execute(
-            "INSERT INTO sessions (id, version, protocol, trace_ids) VALUES (?, ?, ?, ?)",
-            (session_id, 0, _dump_protocol(protocol), "[]"),
+            "INSERT INTO sessions (id, version, locked, protocol, trace_ids) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (session_id, 0, 0, _dump_protocol(protocol), "[]"),
         )
     finally:
         connection.close()
-    return _session_view(session_id, 0, protocol, [])
+    return _session_view(session_id, 0, False, protocol, [])
 
 
 def get_session_view(session_id: str) -> dict:
     connection = _connect()
     try:
         row = connection.execute(
-            "SELECT version, protocol, trace_ids FROM sessions WHERE id = ?",
+            "SELECT version, locked, protocol, trace_ids FROM sessions WHERE id = ?",
             (session_id,),
         ).fetchone()
     finally:
         connection.close()
     if row is None:
         raise HTTPException(status_code=404, detail="unknown session")
-    version, protocol_text, trace_text = row
+    version, locked, protocol_text, trace_text = row
     return _session_view(
         session_id,
         version,
+        bool(locked),
         DeadlockRequest.model_validate(json.loads(protocol_text)),
         json.loads(trace_text),
     )
 
 
 def execute_transition(session_id: str, transition_id: str, expected_version: int) -> dict:
-    def mutate(version: int, protocol, trace_ids: list[str]):
-        if version != expected_version:
-            raise _version_conflict(version)
-
+    def mutate(version, locked, protocol, trace_ids):
         model = build_model(protocol)
         configuration = _replay(model, trace_ids)
 
@@ -177,16 +225,13 @@ def execute_transition(session_id: str, transition_id: str, expected_version: in
                 },
             )
 
-        return version + 1, protocol, trace_ids + [transition_id]
+        return version + 1, locked, protocol, trace_ids + [transition_id]
 
-    return _update_session(session_id, mutate)
+    return _update_session(session_id, expected_version, mutate)
 
 
 def replace_protocol(session_id: str, protocol, expected_version: int) -> dict:
-    def mutate(version: int, _stored_protocol, trace_ids: list[str]):
-        if version != expected_version:
-            raise _version_conflict(version)
-
+    def mutate(version, locked, _stored_protocol, trace_ids):
         # Replay the already executed ids from the new initial configuration.
         # Every step must be enabled and the trace must not reach a completion
         # configuration before its last step; otherwise the old session stands.
@@ -204,9 +249,9 @@ def replace_protocol(session_id: str, protocol, expected_version: int) -> dict:
                 raise _replay_failure(index, f"transition {transition_id!r} is not enabled")
             configuration = apply_transition(configuration, transition)
 
-        return version + 1, protocol, trace_ids
+        return version + 1, locked, protocol, trace_ids
 
-    return _update_session(session_id, mutate)
+    return _update_session(session_id, expected_version, mutate)
 
 
 def branch_session(session_id: str, expected_version: int, prefix_length: int) -> dict:
@@ -228,12 +273,12 @@ def branch_session(session_id: str, expected_version: int, prefix_length: int) -
     try:
         connection.execute("BEGIN IMMEDIATE")
         row = connection.execute(
-            "SELECT version, protocol, trace_ids FROM sessions WHERE id = ?",
+            "SELECT version, locked, protocol, trace_ids FROM sessions WHERE id = ?",
             (session_id,),
         ).fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail="unknown session")
-        version, protocol_text, trace_text = row
+        version, _locked, protocol_text, trace_text = row
         if version != expected_version:
             raise _version_conflict(version)
         trace_ids = json.loads(trace_text)
@@ -249,13 +294,16 @@ def branch_session(session_id: str, expected_version: int, prefix_length: int) -
 
         branch_id = uuid4().hex
         branch_trace_ids = trace_ids[:prefix_length]
+        # A branch is a fresh drill session and always starts unlocked even
+        # when it was cut from a locked read-only baseline.
         connection.execute(
-            "INSERT INTO sessions (id, version, protocol, trace_ids) VALUES (?, ?, ?, ?)",
-            (branch_id, 0, protocol_text, json.dumps(branch_trace_ids)),
+            "INSERT INTO sessions (id, version, locked, protocol, trace_ids) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (branch_id, 0, 0, protocol_text, json.dumps(branch_trace_ids)),
         )
         connection.commit()
         protocol = DeadlockRequest.model_validate(json.loads(protocol_text))
-        return _session_view(branch_id, 0, protocol, branch_trace_ids)
+        return _session_view(branch_id, 0, False, protocol, branch_trace_ids)
     except BaseException:
         # No-op when the commit already succeeded.
         connection.rollback()
@@ -282,8 +330,10 @@ def adopt_trace(
     observe the same committed snapshot: when either session is modified
     concurrently the request either accepts the whole outcome of the named
     versions or is rejected as stale. Acceptance therefore cannot both win
-    against an execution or a protocol replacement submitted for the same
-    target version. Any failure raises before commit and writes nothing.
+    against an execution, a protocol replacement or a lock setting submitted
+    for the same target version. A locked target is refused as 409 like a
+    stale one; a locked *source* is fine, since adoption never writes it. Any
+    failure raises before commit and writes nothing.
     """
     # A session cannot adopt from itself; this is rejected before any I/O.
     if source_session_id == target_session_id:
@@ -299,23 +349,26 @@ def adopt_trace(
     try:
         connection.execute("BEGIN IMMEDIATE")
         target_row = connection.execute(
-            "SELECT version, protocol, trace_ids FROM sessions WHERE id = ?",
+            "SELECT version, locked, protocol, trace_ids FROM sessions WHERE id = ?",
             (target_session_id,),
         ).fetchone()
         if target_row is None:
             raise HTTPException(status_code=404, detail="unknown session")
         source_row = connection.execute(
-            "SELECT version, protocol, trace_ids FROM sessions WHERE id = ?",
+            "SELECT version, locked, protocol, trace_ids FROM sessions WHERE id = ?",
             (source_session_id,),
         ).fetchone()
         if source_row is None:
             raise HTTPException(status_code=404, detail="unknown session")
 
-        target_version, target_protocol_text, target_trace_text = target_row
-        source_version, source_protocol_text, source_trace_text = source_row
+        target_version, target_locked, target_protocol_text, target_trace_text = target_row
+        source_version, _source_locked, source_protocol_text, source_trace_text = source_row
 
         # Version checks precede the semantic ones: a stale acceptance is
-        # always a conflict, never a protocol/prefix mismatch.
+        # always a conflict, never a protocol/prefix mismatch, and a locked
+        # baseline is likewise a conflict — checked before the 422 semantics
+        # so a locked target is never rewritten even when the adoption would
+        # fail validation.
         if target_version != target_expected_version:
             raise _version_conflict(
                 target_version, session="target", session_id=target_session_id
@@ -324,6 +377,8 @@ def adopt_trace(
             raise _version_conflict(
                 source_version, session="source", session_id=source_session_id
             )
+        if target_locked:
+            raise _locked_conflict(target_session_id)
 
         # The stored text is canonical JSON of the validated protocol, so
         # string equality covers every field value as well as the order of the
@@ -372,7 +427,9 @@ def adopt_trace(
         )
         connection.commit()
         protocol = DeadlockRequest.model_validate(json.loads(target_protocol_text))
-        return _session_view(target_session_id, new_version, protocol, new_trace_ids)
+        return _session_view(
+            target_session_id, new_version, bool(target_locked), protocol, new_trace_ids
+        )
     except BaseException:
         # No-op when the commit already succeeded.
         connection.rollback()
@@ -553,16 +610,79 @@ def _comparison_conflict(current_version: int, side: str,
     )
 
 
-def _update_session(session_id: str, mutate) -> dict:
+def _update_session(session_id: str, expected_version: int, mutate) -> dict:
     """Apply ``mutate`` to the stored row inside one immediate transaction.
 
-    ``mutate(version, protocol, trace_ids)`` returns the replacement triple;
-    the transaction commits only when it returns, so any HTTPException it
-    raises leaves the stored session untouched. ``BEGIN IMMEDIATE`` takes the
-    database write lock before the row is read, so the version check, the
-    trace replay and the write all run against the same committed state even
-    when another process races the same session. The returned view is built
-    from the triple this transaction committed, never re-read afterwards.
+    ``mutate(version, locked, protocol, trace_ids)`` returns the replacement
+    quadruple; the lock flag is passed through unchanged by the drill-writing
+    callbacks (only ``set_lock`` flips it). The transaction commits only when
+    it returns, so any HTTPException it raises leaves the stored session
+    untouched. ``BEGIN IMMEDIATE`` takes the database write lock before the row
+    is read, so the version check, the lock check, the trace replay and the
+    write all run against the same committed state even when another process
+    races the same session: a stale expected version or a locked baseline
+    answers 409 before any semantic 422 check, and two writes submitted for the
+    same version (including a lock setting) cannot both succeed. The returned
+    view is built from the values this transaction committed, never re-read
+    afterwards.
+    """
+    connection = _connect()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT version, locked, protocol, trace_ids FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="unknown session")
+        version, stored_locked, protocol_text, trace_text = row
+        if version != expected_version:
+            raise _version_conflict(version)
+        if stored_locked:
+            raise _locked_conflict(session_id)
+        protocol = DeadlockRequest.model_validate(json.loads(protocol_text))
+        trace_ids = json.loads(trace_text)
+
+        new_version, new_locked, new_protocol, new_trace_ids = mutate(
+            version, bool(stored_locked), protocol, trace_ids
+        )
+
+        connection.execute(
+            "UPDATE sessions SET version = ?, locked = ?, protocol = ?, trace_ids = ? WHERE id = ?",
+            (
+                new_version,
+                1 if new_locked else 0,
+                _dump_protocol(new_protocol),
+                json.dumps(new_trace_ids),
+                session_id,
+            ),
+        )
+        connection.commit()
+        return _session_view(
+            session_id, new_version, new_locked, new_protocol, new_trace_ids
+        )
+    except BaseException:
+        # No-op when the commit already succeeded.
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def set_lock(session_id: str, expected_version: int, locked: bool) -> dict:
+    """Flip the read-only baseline flag, changing nothing else.
+
+    The version check and the flag write run inside one ``BEGIN IMMEDIATE``
+    transaction against the same committed state as every other writer, so on
+    one version a lock setting and an execution, a protocol replacement or a
+    targeting adoption are mutually exclusive — at most one commits and the
+    others answer 409 with the stored ``current_version``. Setting the flag
+    also advances the version by one when the value is unchanged; the protocol
+    and trace are never rewritten, so locking leaves the drill itself byte for
+    byte intact and unlocking publishes a fresh version the drill can resume
+    from. Re-locking an already locked session is allowed: only the flag write
+    itself is exempt from the read-only restriction, and every such write
+    still consumes a version.
     """
     connection = _connect()
     try:
@@ -574,17 +694,19 @@ def _update_session(session_id: str, mutate) -> dict:
         if row is None:
             raise HTTPException(status_code=404, detail="unknown session")
         version, protocol_text, trace_text = row
-        protocol = DeadlockRequest.model_validate(json.loads(protocol_text))
-        trace_ids = json.loads(trace_text)
+        if version != expected_version:
+            raise _version_conflict(version)
 
-        new_version, new_protocol, new_trace_ids = mutate(version, protocol, trace_ids)
-
+        new_version = version + 1
         connection.execute(
-            "UPDATE sessions SET version = ?, protocol = ?, trace_ids = ? WHERE id = ?",
-            (new_version, _dump_protocol(new_protocol), json.dumps(new_trace_ids), session_id),
+            "UPDATE sessions SET version = ?, locked = ? WHERE id = ?",
+            (new_version, 1 if locked else 0, session_id),
         )
         connection.commit()
-        return _session_view(session_id, new_version, new_protocol, new_trace_ids)
+        protocol = DeadlockRequest.model_validate(json.loads(protocol_text))
+        return _session_view(
+            session_id, new_version, locked, protocol, json.loads(trace_text)
+        )
     except BaseException:
         # No-op when the commit already succeeded.
         connection.rollback()
@@ -607,6 +729,16 @@ def _version_conflict(current_version: int, session: str | None = None,
     return HTTPException(status_code=409, detail=detail)
 
 
+def _locked_conflict(session_id: str) -> HTTPException:
+    # A locked baseline refusing a drill-writing request is a conflict against
+    # the current committed state, reported in the same 409 shape as a stale
+    # expected version so the caller can unlock and retry.
+    return HTTPException(
+        status_code=409,
+        detail={"error": "session_locked", "session_id": session_id},
+    )
+
+
 def _replay_failure(index: int, reason: str) -> HTTPException:
     return HTTPException(
         status_code=422,
@@ -627,9 +759,11 @@ def _replay(model, trace_ids: list[str]):
     return configuration
 
 
-def _session_view(session_id: str, version: int, protocol, trace_ids: list[str]) -> dict:
-    # Every value comes from one stored revision, so protocol, configuration,
-    # trace and version always belong to the same committed snapshot.
+def _session_view(session_id: str, version: int, locked: bool, protocol,
+                  trace_ids: list[str]) -> dict:
+    # Every value comes from one stored revision, so the lock flag, protocol,
+    # configuration, trace and version always belong to the same committed
+    # snapshot.
     model = build_model(protocol)
     by_id = {transition.id: transition for transition in model.transitions}
 
@@ -653,6 +787,7 @@ def _session_view(session_id: str, version: int, protocol, trace_ids: list[str])
     return {
         "id": session_id,
         "version": version,
+        "locked": locked,
         "protocol": protocol,
         "configuration": _configuration_view(configuration),
         "trace": trace,

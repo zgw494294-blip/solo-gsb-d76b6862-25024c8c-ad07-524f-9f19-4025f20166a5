@@ -1,6 +1,6 @@
 from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field, WrapValidator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, WrapValidator, model_validator
 from typing_extensions import Self
 
 
@@ -250,6 +250,15 @@ class AdoptionRequest(BaseModel):
     source_expected_version: Annotated[int, Field(ge=0)]
 
 
+class LockRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    expected_version: Annotated[int, Field(ge=0)]
+    # StrictBool: only JSON true/false are accepted; booleans-as-ints and any
+    # string/number are rejected with 422 before the database is touched.
+    locked: StrictBool
+
+
 class SessionComparisonRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
@@ -266,6 +275,12 @@ class SessionComparisonRequest(BaseModel):
 class SessionView(BaseModel):
     id: str
     version: int
+    # Read-only baseline flag: a locked session rejects every write that moves
+    # its own drill forward (transition execution, protocol replacement and
+    # adoption targeting it); queries, comparisons, branching and adoption from
+    # it stay available. New sessions and sessions in pre-lock databases are
+    # reported unlocked (false) until explicitly locked.
+    locked: bool = False
     protocol: DeadlockRequest
     configuration: ConfigurationView
     trace: list[PathStep]

@@ -16,6 +16,7 @@ from .schemas import (
     ExecutionRequest,
     GuaranteeRequest,
     GuaranteeResponse,
+    LockRequest,
     ProtocolReplaceRequest,
     SessionComparisonRequest,
     SessionComparisonResponse,
@@ -34,7 +35,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Offline Two-Party Message Protocol Deadlock Analyzer",
-    version="1.6.0",
+    version="1.7.0",
     lifespan=lifespan,
 )
 
@@ -91,6 +92,11 @@ def replace_session_protocol(session_id: str, request: ProtocolReplaceRequest) -
     return sessions.replace_protocol(
         session_id, request.protocol, request.expected_version
     )
+
+
+@app.put("/v1/sessions/{session_id}/lock", response_model=SessionView)
+def set_session_lock(session_id: str, request: LockRequest) -> dict:
+    return sessions.set_lock(session_id, request.expected_version, request.locked)
 
 
 @app.post("/v1/sessions/{session_id}/branches", response_model=SessionView, status_code=201)
